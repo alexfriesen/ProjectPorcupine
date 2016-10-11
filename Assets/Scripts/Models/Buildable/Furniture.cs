@@ -15,6 +15,7 @@ using System.Xml.Serialization;
 using Animation;
 using MoonSharp.Interpreter;
 using MoonSharp.Interpreter.Interop;
+using ProjectPorcupine.Buildable.Components;
 using ProjectPorcupine.Jobs;
 using ProjectPorcupine.PowerNetwork;
 using UnityEngine;
@@ -47,11 +48,8 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
     /// These context menu lua action are used to build the context menu of the furniture.
     /// </summary>
     private List<ContextMenuLuaAction> contextMenuLuaActions;
-
-    /// <summary>
-    /// Workshop reference if furniture is consumer/producer (not null).
-    /// </summary>
-    private FurnitureWorkshop workshop;
+    
+    private HashSet<BuildableComponent> components;
 
     // This is the generic type of object this is, allowing things to interact with it based on it's generic type
     private HashSet<string> typeTags;
@@ -94,6 +92,7 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
         Rotation = 0f;
         DragType = "single";
         LinksToNeighbour = string.Empty;
+        components = new HashSet<BuildableComponent>();
     }
 
     /// <summary>
@@ -120,7 +119,9 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
 
         Parameters = new Parameter(other.Parameters);
         Jobs = new BuildableJobs(this, other.Jobs);
-        workshop = other.workshop; // don't need to clone here, as all are prototype things (not changing)
+
+        // don't need to clone here, as all are prototype things (not changing)
+        components = new HashSet<BuildableComponent>(other.components);
 
         if (other.Animation != null)
         {
@@ -144,7 +145,6 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
         if (other.PowerConnection != null)
         {
             PowerConnection = other.PowerConnection.Clone() as Connection;
-            World.Current.PowerNetwork.PlugIn(PowerConnection);
             PowerConnection.NewThresholdReached += OnNewThresholdReached;
         }
 
@@ -189,16 +189,7 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
     /// </summary>
     /// <value>The Color of the furniture.</value>
     public Color Tint { get; set; }
-
-    /// <summary>
-    /// Returns whether this instance is workshop or not.
-    /// </summary>
-    /// <value><c>true</c> if this instance is workshop; otherwise, <c>false</c>.</value>
-    public bool IsWorkshop
-    {
-        get { return workshop != null; }
-    }
-
+        
     /// <summary>
     /// Gets or sets a value indicating whether the door is Vertical or not.
     /// Should be false if the furniture is not a door.
@@ -376,6 +367,18 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
             return !string.IsNullOrEmpty(getSpriteNameAction);
         }
     }
+
+    /// <summary>
+    /// Whether the furniture has power or not. Always true if power is not applicable to the furniture.
+    /// </summary>
+    /// <returns>True if the furniture has power or if the furniture doesn't require power to function.</returns>
+    public bool DoesntNeedOrHasPower
+    {
+        get
+        {
+            return PowerConnection == null || World.Current.PowerNetwork.HasPower(PowerConnection);
+        }
+    }
     #endregion
 
     /// <summary>
@@ -393,15 +396,10 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
         }
 
         // We know our placement destination is valid.
-        Furniture obj = proto.Clone();
-        obj.Tile = tile;
-        if (obj.IsWorkshop)
-        {
-            // need to update reference to furniture for workshop (is there a nicer way?)
-            obj.workshop.SetParentFurniture(obj);
-        }
-
-        if (tile.PlaceFurniture(obj) == false)
+        Furniture furnObj = proto.Clone();
+        furnObj.Tile = tile;
+        
+        if (tile.PlaceFurniture(furnObj) == false)
         {
             // For some reason, we weren't able to place our object in this tile.
             // (Probably it was already occupied.)
@@ -410,8 +408,20 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
             // (It will be garbage collected.)
             return null;
         }
-        
-        if (obj.LinksToNeighbour != string.Empty)
+
+        // plug-in furniture only when it is placed in world
+        if (furnObj.PowerConnection != null)
+        {
+            World.Current.PowerNetwork.PlugIn(furnObj.PowerConnection);
+        }
+
+        // need to update reference to furniture and call Initialize (so components can place hooks on events there)
+        foreach (BuildableComponent component in furnObj.components)
+        {
+            component.Initialize(furnObj);
+        }
+
+        if (furnObj.LinksToNeighbour != string.Empty)
         {
             // This type of furniture links itself to its neighbours,
             // so we should inform our neighbours that they have a new
@@ -433,21 +443,21 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
         }
 
         // Let our workspot tile know it is reserved for us
-        World.Current.ReserveTileAsWorkSpot(obj);
+        World.Current.ReserveTileAsWorkSpot(furnObj);
 
         // Call LUA install scripts
-        obj.EventActions.Trigger("OnInstall", obj);
+        furnObj.EventActions.Trigger("OnInstall", furnObj);
 
         // Update thermalDiffusivity using coefficient
         float thermalDiffusivity = Temperature.defaultThermalDiffusivity;
-        if (obj.Parameters.ContainsKey("thermal_diffusivity"))
+        if (furnObj.Parameters.ContainsKey("thermal_diffusivity"))
         {
-            thermalDiffusivity = obj.Parameters["thermal_diffusivity"].ToFloat();
+            thermalDiffusivity = furnObj.Parameters["thermal_diffusivity"].ToFloat();
         }
 
         World.Current.temperature.SetThermalDiffusivity(tile.X, tile.Y, tile.Z, thermalDiffusivity);
 
-        return obj;
+        return furnObj;
     }
 
     #region Update and Animation
@@ -462,6 +472,11 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
         {
             EventActions.Trigger("OnFastUpdate", this, deltaTime);
         }
+
+        foreach (BuildableComponent component in components)
+        {
+            component.EveryFrameUpdate(deltaTime);
+        }
     }
 
     /// <summary>
@@ -471,7 +486,17 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
     /// <param name="deltaTime">The time since the last update was called.</param>
     public void FixedFrequencyUpdate(float deltaTime)
     {
-        if (PowerConnection != null && PowerConnection.IsPowerConsumer && HasPower() == false)
+        // requirements from components (gas, ...)
+        bool canFunction = true;
+        foreach (BuildableComponent component in components)
+        {
+            canFunction &= component.CanFunction();
+        }
+
+        IsOperating = DoesntNeedOrHasPower && canFunction;
+
+        if ((PowerConnection != null && PowerConnection.IsPowerConsumer && DoesntNeedOrHasPower == false) ||
+            canFunction == false)
         {
             if (prevUpdatePowerOn)
             {
@@ -491,12 +516,12 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
         {
             EventActions.Trigger("OnUpdate", this, deltaTime);
         }
-
-        if (IsWorkshop && IsBeingDestroyed == false)
+                
+        foreach (BuildableComponent component in components)
         {
-            workshop.Update(deltaTime);
-        }
-
+            component.FixedFrequencyUpdate(deltaTime);
+        }        
+        
         if (Animation != null)
         {
             Animation.Update(deltaTime);
@@ -587,16 +612,6 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
 
         // Else return default Type string
         return Type;
-    }
-
-    /// <summary>
-    /// Whether the furniture has power or not.
-    /// </summary>
-    /// <returns>True if the furniture has power.</returns>
-    public bool HasPower()
-    {
-        IsOperating = PowerConnection == null || World.Current.PowerNetwork.HasPower(PowerConnection);
-        return IsOperating;
     }
     #endregion
 
@@ -755,10 +770,13 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
                     reader.Read();
                     UnlocalizedDescription = reader.ReadContentAsString();
                     break;
-                case "Workshop":                   
-                    workshop = FurnitureWorkshop.Deserialize(reader);
-                    workshop.SetParentFurniture(this);
-                    workshop.Initialize();
+                case "Component":
+                    BuildableComponent component = BuildableComponent.Deserialize(reader);
+                    if (component != null)
+                    {
+                        components.Add(component);
+                    }
+
                     break;
             }
         }
@@ -1044,16 +1062,21 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
 
     public IEnumerable<string> GetAdditionalInfo()
     {
-        if (IsWorkshop)
+        // try to get some info from components
+        foreach (BuildableComponent component in components)
         {
-            yield return workshop.GetDescription();
+            string desc = component.GetDescription();
+            if (!string.IsNullOrEmpty(desc))
+            {
+                yield return desc;
+            }
         }
-
+        
         yield return string.Format("Hitpoint 18 / 18");
 
         if (PowerConnection != null)
         {
-            bool hasPower = HasPower();
+            bool hasPower = DoesntNeedOrHasPower;
             string powerColor = hasPower ? "green" : "red";
 
             yield return string.Format("Power Grid: <color={0}>{1}</color>", powerColor, hasPower ? "Online" : "Offline");
@@ -1109,15 +1132,19 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
             }
         }
 
-        // context menu if it's workshop and has multiple production chains
-        if (IsWorkshop && workshop.WorkshopMenuActions != null)
+        // check for context menus of components
+        foreach (BuildableComponent component in components)
         {
-            foreach (WorkshopContextMenu factoryContextMenuAction in workshop.WorkshopMenuActions)
+            List<ContextMenuAction> componentContextMenu = component.GetContextMenu();
+            if (componentContextMenu != null)
             {
-                yield return CreateWorkshopContextMenuItem(factoryContextMenuAction);
+                foreach (ContextMenuAction compContextMenuAction in componentContextMenu)
+                {
+                    yield return compContextMenuAction;
+                }
             }
         }
-
+       
         foreach (ContextMenuLuaAction contextMenuLuaAction in contextMenuLuaActions)
         {
             if (!contextMenuLuaAction.DevModeOnly ||
@@ -1225,21 +1252,6 @@ public class Furniture : IXmlSerializable, ISelectable, IPrototypable, IContextA
     }
 
     #region Private Context Menu
-    private ContextMenuAction CreateWorkshopContextMenuItem(WorkshopContextMenu factoryContextMenuAction)
-    {
-        return new ContextMenuAction
-        {
-            Text = factoryContextMenuAction.ProductionChainName, // TODO: localization here
-            RequireCharacterSelected = false,
-            Action = (cma, c) => InvokeContextMenuAction(factoryContextMenuAction.Function, factoryContextMenuAction.ProductionChainName)
-        };
-    }
-
-    private void InvokeContextMenuAction(Action<Furniture, string> function, string arg)
-    {
-        function(this, arg);
-    }
-
     private void InvokeContextMenuLuaAction(ContextMenuAction action, Character character)
     {
         FunctionsManager.Furniture.Call(action.Parameter, this, character);
